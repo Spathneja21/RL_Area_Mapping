@@ -1,0 +1,30 @@
+# Python environment and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Training checkpoints (25 MB+, every 500k steps). Final model (models/ppo_explore.zip + .onnx) is kept.
+models/ckpt/
+
+# Training logs, TensorBoard, and MuJoCo/SLAM run outputs (logs, saved maps); root-owned when made in Docker
+runs/
+*.log
+tb/
+tensorboard/
+
+# ROS / colcon build output, in case the node is ever turned into a package
+build/
+install/
+log/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+PLAN.md
+
