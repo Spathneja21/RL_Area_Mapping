@@ -87,9 +87,8 @@ def _ray_cells(origin, pose, angles, shape):
     return np.clip(r, 0, shape[0] - 1), np.clip(c, 0, shape[1] - 1), inside
 
 
-def cast(occ, origin, pose, n_beams=180):
+def cast(occ, origin, pose, angles=np.linspace(-np.pi, np.pi, 180, endpoint=False)):
     """Simulated lidar on the truth grid -> (beam angles in robot frame, ranges; inf = no return)."""
-    angles = np.linspace(-np.pi, np.pi, n_beams, endpoint=False)
     r, c, _ = _ray_cells(origin, pose, angles, occ.shape)
     hit = occ[r, c]
     any_hit = hit.any(1)
@@ -109,29 +108,38 @@ def integrate(belief, origin, pose, angles, ranges):
     belief[r[hit, k][ok], c[hit, k][ok]] = OCC
 
 
-def _pool(grid, k):
-    """Downsample by k: (any free, any occupied)."""
-    h, w = grid.shape[0] // k * k, grid.shape[1] // k * k
-    g = grid[:h, :w].reshape(h // k, k, w // k, k)
-    return (g == FREE).any(axis=(1, 3)), (g == OCC).any(axis=(1, 3))
+N_CHANNELS = 4 * len(SCALES)
+
+
+def _any_pool(mask, k):
+    """Downsample a bool grid by k (a coarse cell is set if any fine cell is)."""
+    h, w = mask.shape[0] // k * k, mask.shape[1] // k * k
+    return mask[:h, :w].reshape(h // k, k, w // k, k).any(axis=(1, 3))
+
+
+def frontier(belief):
+    """Free cells with an unknown 4-neighbour: the edge of what has been seen."""
+    unk = np.pad(belief == UNKNOWN, 1)
+    return (belief == FREE) & (unk[:-2, 1:-1] | unk[2:, 1:-1] | unk[1:-1, :-2] | unk[1:-1, 2:])
 
 
 def observe(belief, trail, origin, pose):
-    """Egocentric multi-scale crops, robot at centre facing up. -> uint8 (6, CROP, CROP):
-    per scale [free, occupied, visited]."""
+    """Egocentric multi-scale crops, robot at centre facing up. -> uint8 (N_CHANNELS, CROP, CROP):
+    per scale [free, occupied, visited, frontier]."""
     x, y, th = pose
     idx = (CROP / 2 - np.arange(CROP) - 0.5)
     ahead, left = np.meshgrid(idx, idx, indexing='ij')        # row 0 = ahead, col 0 = left
+    layers = (belief == FREE, belief == OCC, trail, frontier(belief))
     chans = []
     for k in SCALES:
         s = k * RES
         wx = x + (ahead * np.cos(th) - left * np.sin(th)) * s - origin[0]
         wy = y + (ahead * np.sin(th) + left * np.cos(th)) * s - origin[1]
-        free, occ = _pool(belief, k)
-        vis = _pool(np.where(trail, FREE, UNKNOWN), k)[0]
+        pooled = [_any_pool(g, k) for g in layers]
+        h, w = pooled[0].shape
         r, c = np.floor(wy / s).astype(int), np.floor(wx / s).astype(int)
-        inside = (r >= 0) & (r < free.shape[0]) & (c >= 0) & (c < free.shape[1])
-        r, c = np.clip(r, 0, free.shape[0] - 1), np.clip(c, 0, free.shape[1] - 1)
-        for g in (free, occ, vis):
+        inside = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+        r, c = np.clip(r, 0, h - 1), np.clip(c, 0, w - 1)
+        for g in pooled:
             chans.append(np.where(inside, g[r, c], False))
     return (np.stack(chans) * 255).astype(np.uint8)

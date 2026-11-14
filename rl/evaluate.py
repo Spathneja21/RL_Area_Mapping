@@ -14,8 +14,14 @@ MAX_STEPS = 1000                         # 1000 s of robot time
 
 
 def ppo_policy(path):
+    """Samples from the policy, as in training. Greedy argmax drives into a wall forever (98% 'forward')."""
     sess = ort.InferenceSession(path)
-    return lambda env, obs: int(np.argmax(sess.run(None, {'obs': obs[None]})[0]))
+
+    def act(env, obs):
+        logits = sess.run(None, {'obs': obs[None]})[0][0]
+        p = np.exp(logits - logits.max())
+        return int(env.np_random.choice(len(p), p=p / p.sum()))
+    return act
 
 
 def random_policy(env, obs):

@@ -36,6 +36,9 @@ class RLExplorer(Node):
         self.max_time = self.declare_parameter('max_time_s', 900.0).value
         self.stop_dist = self.declare_parameter('stop_dist', 0.25).value   # lidar guard, front +-30 deg
         self.sess = ort.InferenceSession(model)
+        n_in = self.sess.get_inputs()[0].shape[1]
+        # v1 models (6 ch) predate the frontier channel: per scale [free, occ, visited] only
+        self.chans = [0, 1, 2, 4, 5, 6] if n_in == 6 else list(range(n_in))
         n = int(2 * HALF / RES)
         self.origin = np.array([-HALF, -HALF])
         self.belief = np.full((n, n), UNKNOWN, np.int8)
@@ -90,7 +93,9 @@ class RLExplorer(Node):
         r, c = np.floor((p[1::-1] - self.origin[::-1]) / RES).astype(int)
         self.trail[r, c] = True
         obs = observe(self.belief, self.trail, self.origin, p)
-        self.cmd = ACTIONS[int(np.argmax(self.sess.run(None, {'obs': obs[None]})[0]))].copy()
+        logits = self.sess.run(None, {'obs': obs[None, self.chans]})[0][0]
+        prob = np.exp(logits - logits.max())                   # sample like in training; argmax gets stuck
+        self.cmd = ACTIONS[np.random.choice(len(prob), p=prob / prob.sum())].copy()
 
     def drive(self):
         v, w = self.cmd

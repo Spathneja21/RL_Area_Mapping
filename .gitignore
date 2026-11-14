@@ -8,6 +8,8 @@ __pycache__/
 
 # Training checkpoints (25 MB+, every 500k steps). Final model (models/ppo_explore.zip + .onnx) is kept.
 models/ckpt/
+models
+docs
 
 # Training logs, TensorBoard, and MuJoCo/SLAM run outputs (logs, saved maps); root-owned when made in Docker
 runs/

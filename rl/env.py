@@ -6,7 +6,7 @@ import os
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from mapping import RES, CROP, UNKNOWN, FREE, load_truth, dilate, flood, cast, integrate, observe
+from mapping import RES, CROP, N_CHANNELS, UNKNOWN, FREE, load_truth, dilate, flood, cast, integrate, observe
 
 MAPS_DIR = os.environ.get('AMR_MAPS', os.path.expanduser('~/projects/AMR_Practice_project/src/amr_bot/maps'))
 # office = Clearpath office (~42 x 23 m), market = supermarket (~12 x 8 m)
@@ -14,6 +14,8 @@ MAPS = {'office': 'office.yaml', 'market': 'market.yaml'}
 DT = 1.0                                   # s per decision
 # (v m/s, w rad/s) — same limits as lidar_explorer (v_max 0.2, w_max 0.8)
 ACTIONS = np.array([[0.2, 0.0], [0.2, 0.6], [0.2, -0.6], [0.0, 0.8], [0.0, -0.8]])
+FRONT = np.radians(np.arange(-30, 31, 5))  # lidar guard: beams within +-30 deg of straight ahead
+STOP_DIST = 0.25                           # m, = rl_explorer stop_dist
 ROBOT_R = 0.15
 MARGIN = 0.05
 
@@ -38,10 +40,12 @@ class _World:
 
 
 class ExploreEnv(gym.Env):
-    def __init__(self, maps=('office', 'market'), max_steps=600, seed=None):
+    def __init__(self, maps=('office', 'market'), max_steps=1000, seed=None, pre_explore=0.0, guard=True):
         self.worlds = [_World(os.path.join(MAPS_DIR, MAPS[m])) for m in maps]
         self.max_steps = max_steps
-        self.observation_space = spaces.Box(0, 255, (6, CROP, CROP), np.uint8)
+        self.guard = guard
+        self.pre_explore = pre_explore             # P(episode starts with the area around the spawn mapped)
+        self.observation_space = spaces.Box(0, 255, (N_CHANNELS, CROP, CROP), np.uint8)
         self.action_space = spaces.Discrete(len(ACTIONS))
         self.np_random = np.random.default_rng(seed)
 
@@ -73,6 +77,15 @@ class ExploreEnv(gym.Env):
         self.belief = np.full(self.w.occ.shape, UNKNOWN, np.int8)
         self.trail = np.zeros(self.w.occ.shape, bool)
         self.known, self.steps, self.collisions = 0, 0, 0
+        if self.np_random.random() < self.pre_explore:
+            # Mid-exploration start: scans from 2-12 visited spots within 3-15 m are already mapped, so
+            # "everything near me is done, go elsewhere" (the hard part of exploring) is common in training.
+            near = self.w.spawn[np.hypot(*(self.w.spawn - (r, c)).T) * RES < self.np_random.uniform(3, 15)]
+            for rr, cc in near[self.np_random.integers(len(near), size=self.np_random.integers(2, 13))]:
+                p = np.array([(cc + 0.5) * RES + self.w.origin[0], (rr + 0.5) * RES + self.w.origin[1], 0.0])
+                integrate(self.belief, self.w.origin, p, *cast(self.w.occ, self.w.origin, p))
+                self.trail[rr, cc] = True
+            self.known = int((self.belief != UNKNOWN).sum())
         self._sense()
         return self._obs(), {}
 
@@ -84,6 +97,8 @@ class ExploreEnv(gym.Env):
         collided = False
         n = 10
         for _ in range(n):
+            if self.guard and v > 0 and cast(self.w.occ, self.w.origin, self.pose, FRONT)[1].min() < STOP_DIST:
+                v, wz = 0.0, wz or 0.8             # same lidar guard as ros/rl_explorer.py: rotate, don't push
             x, y, th = self.pose
             nxt = np.array([x + v * np.cos(th) * DT / n, y + v * np.sin(th) * DT / n, th + wz * DT / n])
             r, c = self._cell(nxt)
@@ -106,7 +121,11 @@ if __name__ == '__main__':   # self-check: spawn, sensing, collision blocking, o
     for w, name in zip(env.worlds, MAPS):
         print(name, w.occ.shape, 'spawn cells', len(w.spawn), 'mappable m^2', w.mappable * RES * RES)
     obs, _ = env.reset(seed=1)
-    assert obs.shape == (6, CROP, CROP) and obs[0].any(), 'robot must see free space at spawn'
+    assert obs.shape == (N_CHANNELS, CROP, CROP) and obs[0].any(), 'robot must see free space at spawn'
+    assert obs[3].any() or obs[7].any(), 'a fresh map must have frontiers'
+    pre = ExploreEnv(maps=('office',), seed=0, pre_explore=1.0)
+    pre.reset(seed=2)
+    assert pre.known > env.known and pre.trail.sum() >= 2, 'pre-explored start must reveal more map'
     r0 = env.known
     t = time.time()
     total, cov = 0, []

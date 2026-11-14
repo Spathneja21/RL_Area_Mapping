@@ -37,9 +37,9 @@ if __name__ == '__main__':
     STEPS = int(float(sys.argv[1])) if len(sys.argv) > 1 else 3_000_000
     NAME = sys.argv[2] if len(sys.argv) > 2 else 'ppo_explore'
     torch.set_num_threads(4)
-    venv = make_vec_env(ExploreEnv, n_envs=12, vec_env_cls=SubprocVecEnv, seed=0)
+    venv = make_vec_env(ExploreEnv, n_envs=12, env_kwargs={'pre_explore': 0.5}, vec_env_cls=SubprocVecEnv, seed=0)
     model = PPO('CnnPolicy', venv, n_steps=256, batch_size=512, n_epochs=4, learning_rate=2.5e-4,
-                gamma=0.99, gae_lambda=0.95, clip_range=0.1, ent_coef=0.01, verbose=1,
+                gamma=0.995, gae_lambda=0.95, clip_range=0.1, ent_coef=0.01, verbose=1,
                 tensorboard_log=None, device='cpu', seed=0)
     model.learn(STEPS, callback=CheckpointCallback(500_000 // 12, f'{OUT}/ckpt', NAME), progress_bar=False)
     model.save(f'{OUT}/{NAME}')
