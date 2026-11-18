@@ -1,118 +1,79 @@
-"""Compare policies in the 2D sim: PPO (via the exported ONNX, same as the ROS node), frontier baseline, random.
-usage: python evaluate.py ../models/ppo_explore.onnx [episodes_per_map]"""
+"""Compare exploration policies in the 2D sim on the same spawns.
+usage: python evaluate.py MODEL.onnx [episodes_per_map]
+
+ppo      the ONNX model, actions sampled (flat 6/8-channel models on ExploreEnv, macro models on MacroExploreEnv)
+greedy   always the nearest frontier (slot 0) with the shared BFS planner: the classic frontier explorer
+random   a random frontier candidate each decision, same planner
+"""
 import sys
-from collections import deque
 import numpy as np
 import onnxruntime as ort
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from env import ExploreEnv, ACTIONS
-from mapping import RES, FREE, OCC, UNKNOWN, dilate
+from env import ExploreEnv, MacroExploreEnv
+from mapping import RES
 
 MAX_STEPS = 1000                         # 1000 s of robot time
 
 
+def _sample(env, logits):
+    p = np.exp(logits - logits.max())
+    return int(env.np_random.choice(len(p), p=p / p.sum()))
+
+
 def ppo_policy(path):
-    """Samples from the policy, as in training. Greedy argmax drives into a wall forever (98% 'forward')."""
+    """-> (env class, act). Samples from the policy, as in training (argmax pins the flat policy to walls)."""
     sess = ort.InferenceSession(path)
-
-    def act(env, obs):
-        logits = sess.run(None, {'obs': obs[None]})[0][0]
-        p = np.exp(logits - logits.max())
-        return int(env.np_random.choice(len(p), p=p / p.sum()))
-    return act
-
-
-def random_policy(env, obs):
-    return int(env.np_random.integers(len(ACTIONS)))
+    inputs = [i.name for i in sess.get_inputs()]
+    if len(inputs) > 1:                                    # macro: inputs 'cands' and 'map'
+        return MacroExploreEnv, lambda env, obs: _sample(env, sess.run(None, {k: obs[k][None] for k in inputs})[0][0])
+    chans = [0, 1, 2, 4, 5, 6] if sess.get_inputs()[0].shape[1] == 6 else slice(None)   # v1: no frontier channel
+    return ExploreEnv, lambda env, obs: _sample(env, sess.run(None, {'obs': obs[None, chans]})[0][0])
 
 
-def frontier_policy(env, obs):
-    """Classic baseline: BFS on the known map to the nearest frontier, steer at a point ~0.5 m along the route."""
-    b = env.belief
-    if env.steps == 0:
-        env.bumps, env.last_coll, env.goal, env.stall = np.zeros(b.shape, bool), 0, None, (0, 0)
-    if env.known > env.stall[0]:
-        env.stall = (env.known, env.steps)
-    elif env.steps - env.stall[1] >= 30 and env.goal:   # 30 s without new map: blacklist the goal (as lidar_explorer)
-        env.bumps[env.goal] = True
-        env.stall = (env.known, env.steps)
-    if env.collisions > env.last_coll:                   # bumper: remember the cell we ran into
-        env.last_coll = env.collisions
-        r, c = env._cell(env.pose + [0.25 * np.cos(env.pose[2]), 0.25 * np.sin(env.pose[2]), 0])
-        env.bumps[min(max(r, 0), b.shape[0] - 1), min(max(c, 0), b.shape[1] - 1)] = True
-    safe = (b == FREE) & ~dilate(b == OCC, 2) & ~env.bumps
-    walk = safe & ~dilate((b == OCC) | env.bumps, 3)      # +0.1 m margin so heading drift doesn't rub walls
-    unk = b == UNKNOWN
-    start = env._cell(env.pose)
-    for trav in (walk, safe):                            # tight spots: retry without the margin
-        front = trav & (np.roll(unk, 1, 0) | np.roll(unk, -1, 0) | np.roll(unk, 1, 1) | np.roll(unk, -1, 1))
-        prev, q, goal = {start: None}, deque([start]), None
-        while q:
-            cur = q.popleft()
-            if front[cur] and abs(cur[0] - start[0]) + abs(cur[1] - start[1]) > 5:
-                goal = cur
-                break
-            for d in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                n = (cur[0] + d[0], cur[1] + d[1])
-                near = abs(n[0] - start[0]) + abs(n[1] - start[1]) <= 3    # escape zone when inside inflation
-                if 0 <= n[0] < b.shape[0] and 0 <= n[1] < b.shape[1] and n not in prev and \
-                        (trav[n] or near and safe[n]):
-                    prev[n] = cur
-                    q.append(n)
-        if goal is not None:
-            env.goal = goal
-            break
-    else:
-        return 3                                         # nothing reachable: spin
-    path = [goal]
-    while prev[path[-1]] is not None:
-        path.append(prev[path[-1]])
-    tgt = path[max(len(path) - 6, 0)]
-    err = np.arctan2(tgt[0] - start[0], tgt[1] - start[1]) - env.pose[2]
-    err = (err + np.pi) % (2 * np.pi) - np.pi
-    if abs(err) > 0.6:
-        return 3 if err > 0 else 4
-    if abs(err) > 0.15:
-        return 1 if err > 0 else 2
+def greedy_policy(env, obs):
     return 0
 
 
+def random_frontier_policy(env, obs):
+    return int(env.np_random.integers(max(len(env.goals), 1)))
+
+
 def run(env, policy, seed):
+    """One episode -> (coverage per second, padded to MAX_STEPS + 1; trajectory; collisions)."""
     obs, _ = env.reset(seed=seed)
-    cov, traj = [env.coverage()], [env.pose[:2].copy()]
-    for _ in range(MAX_STEPS):
-        obs, _, done, _, info = env.step(policy(env, obs))
-        cov.append(info['coverage'])
-        traj.append(env.pose[:2].copy())
-        if done:
-            break
-    cov += [cov[-1]] * (MAX_STEPS + 1 - len(cov))
-    return np.array(cov), np.array(traj), env.collisions
+    done = trunc = False
+    while not (done or trunc):
+        obs, _, done, trunc, _ = env.step(policy(env, obs))
+    cov = env.cov_log[:MAX_STEPS + 1]
+    return np.array(cov + [cov[-1]] * (MAX_STEPS + 1 - len(cov))), np.array(env.traj), env.collisions
 
 
 if __name__ == '__main__':
     onnx_path = sys.argv[1]
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-    policies = {'ppo': ppo_policy(onnx_path), 'frontier': frontier_policy, 'random': random_policy}
+    ppo_env, ppo = ppo_policy(onnx_path)
+    policies = {'ppo': (ppo_env, ppo), 'greedy': (MacroExploreEnv, greedy_policy),
+                'random': (MacroExploreEnv, random_frontier_policy)}
     out = onnx_path.replace('.onnx', '')
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     lines = []
     for ax, m in zip(axes, ('office', 'market')):
-        env = ExploreEnv(maps=(m,), max_steps=MAX_STEPS)
-        for name, pol in policies.items():
+        for name, (env_cls, pol) in policies.items():
+            env = env_cls(maps=(m,), max_steps=MAX_STEPS)
             res = [run(env, pol, 1000 + s) for s in range(n)]          # same spawns for every policy
             covs = np.array([r[0] for r in res])
-            t90 = [int(np.argmax(c >= 0.9)) if (c >= 0.9).any() else None for c in covs]
-            lines.append(f'{m:7s} {name:9s} final cov {covs[:, -1].mean():.3f} ± {covs[:, -1].std():.3f}  '
-                         f'cov@300s {covs[:, 300].mean():.3f}  reached 90%: {sum(t is not None for t in t90)}/{n}'
-                         f'  t90 median {np.median([t for t in t90 if t is not None]) if any(t90) else "-"} s  '
+            t90 = [int(np.argmax(c >= 0.9)) for c in covs if (c >= 0.9).any()]
+            lines.append(f'{m:7s} {name:7s} final cov {covs[:, -1].mean():.3f} ± {covs[:, -1].std():.3f}  '
+                         f'cov@300s {covs[:, 300].mean():.3f}  reached 90%: {len(t90)}/{n}  '
+                         f't90 median {np.median(t90) if t90 else "-"} s  '
                          f'collisions {np.mean([r[2] for r in res]):.1f}')
             print(lines[-1], flush=True)
             ax.plot(covs.mean(0), label=name)
             if name == 'ppo':
-                cov, traj, _ = run(env, pol, 1000)        # replay episode 0 (deterministic) for its map
+                cov, traj, _ = res[0]
+                run(env, pol, 1000)                       # replay episode 0 (seeded, deterministic) for its map
                 plt.figure(figsize=(10, 6))
                 plt.imshow(env.belief, origin='lower', cmap='gray_r', vmin=-1, vmax=1,
                            extent=[env.w.origin[0], env.w.origin[0] + env.belief.shape[1] * RES,

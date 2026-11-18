@@ -23,6 +23,9 @@ from tf2_ros import Buffer, TransformListener
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'rl'))
 from mapping import RES, UNKNOWN, integrate, observe  # noqa: E402
+from frontier import plan, candidates, is_frontier, path_to, steer, REACHED  # noqa: E402
+
+MAX_GOAL_S = 60.0                               # = MacroExploreEnv.max_macro_s
 
 DT = 1.0
 ACTIONS = np.array([[0.2, 0.0], [0.2, 0.6], [0.2, -0.6], [0.0, 0.8], [0.0, -0.8]])   # must match rl/env.py
@@ -36,10 +39,14 @@ class RLExplorer(Node):
         self.max_time = self.declare_parameter('max_time_s', 900.0).value
         self.stop_dist = self.declare_parameter('stop_dist', 0.25).value   # lidar guard, front +-30 deg
         self.sess = ort.InferenceSession(model)
+        self.inputs = [i.name for i in self.sess.get_inputs()]
+        self.macro = len(self.inputs) > 1               # v3: policy picks frontier candidates ('cands', 'map')
         n_in = self.sess.get_inputs()[0].shape[1]
         # v1 models (6 ch) predate the frontier channel: per scale [free, occ, visited] only
         self.chans = [0, 1, 2, 4, 5, 6] if n_in == 6 else list(range(n_in))
+        self.goal, self.path, self.goal_t, self.goal_known, self.complete = None, None, 0.0, 0, False
         n = int(2 * HALF / RES)
+        self.bumps = np.zeros((n, n), bool)              # blacklisted goals (no bumper on this robot)
         self.origin = np.array([-HALF, -HALF])
         self.belief = np.full((n, n), UNKNOWN, np.int8)
         self.trail = np.zeros((n, n), bool)
@@ -91,11 +98,48 @@ class RLExplorer(Node):
         keep = ~np.isnan(ranges)
         integrate(self.belief, self.origin, p, angles[keep], ranges[keep])
         r, c = np.floor((p[1::-1] - self.origin[::-1]) / RES).astype(int)
-        self.trail[r, c] = True
+        if 0 <= r < self.trail.shape[0] and 0 <= c < self.trail.shape[1]:
+            self.trail[r, c] = True
         obs = observe(self.belief, self.trail, self.origin, p)
-        logits = self.sess.run(None, {'obs': obs[None, self.chans]})[0][0]
+        if self.macro:
+            a = self.follow_frontier(p, (r, c), obs, now)
+            self.cmd = np.zeros(2) if a is None else ACTIONS[a].copy()
+        else:
+            self.cmd = ACTIONS[self.sample({'obs': obs[None, self.chans]})].copy()
+
+    def sample(self, feed):
+        logits = self.sess.run(None, feed)[0][0]
         prob = np.exp(logits - logits.max())                   # sample like in training; argmax gets stuck
-        self.cmd = ACTIONS[np.random.choice(len(prob), p=prob / prob.sum())].copy()
+        return int(np.random.choice(len(prob), p=prob / prob.sum()))
+
+    def follow_frontier(self, p, cell, obs, now):
+        """Macro mode, mirrors MacroExploreEnv.step: keep driving to the chosen frontier; when it is reached,
+        seen, or 60 s pass, let the policy choose the next one. Returns a primitive index, None when done."""
+        if self.complete:
+            return None
+        g = self.goal
+        if g is not None:
+            timeout = now - self.goal_t > MAX_GOAL_S
+            if not (timeout or abs(cell[0] - g[0]) + abs(cell[1] - g[1]) <= REACHED
+                    or not is_frontier(self.belief, g)):
+                return steer(p, self.path, self.origin)
+            if (self.belief != UNKNOWN).sum() == self.goal_known and is_frontier(self.belief, g):
+                self.bumps[tuple(g)] = True                    # no progress: blacklist this goal
+        for _ in range(2):
+            dist = plan(self.belief, self.bumps, cell)
+            goals, feats = candidates(self.belief, dist, p, self.origin)
+            if len(goals) or not self.bumps.any():
+                break
+            self.bumps[:] = False                              # nothing left: forget the blacklist once
+        if not len(goals):
+            self.complete = True
+            self.get_logger().info(f'exploration complete: no reachable frontier left ({self.slam_area:.1f} m^2)')
+            return None
+        a = self.sample({'cands': feats[None], 'map': obs[None]})
+        self.goal = goals[min(a, len(goals) - 1)]
+        self.path, self.goal_t = path_to(dist, self.goal), now
+        self.goal_known = int((self.belief != UNKNOWN).sum())
+        return steer(p, self.path, self.origin)
 
     def drive(self):
         v, w = self.cmd

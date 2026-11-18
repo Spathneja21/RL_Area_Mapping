@@ -7,6 +7,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from mapping import RES, CROP, N_CHANNELS, UNKNOWN, FREE, load_truth, dilate, flood, cast, integrate, observe
+from frontier import K, N_FEAT, REACHED, plan, candidates, is_frontier, path_to, steer
 
 MAPS_DIR = os.environ.get('AMR_MAPS', os.path.expanduser('~/projects/AMR_Practice_project/src/amr_bot/maps'))
 # office = Clearpath office (~42 x 23 m), market = supermarket (~12 x 8 m)
@@ -87,12 +88,21 @@ class ExploreEnv(gym.Env):
                 self.trail[rr, cc] = True
             self.known = int((self.belief != UNKNOWN).sum())
         self._sense()
+        self.cov_log = [self.coverage()]                # coverage per second, for evaluation curves
+        self.traj = [self.pose[:2].copy()]
         return self._obs(), {}
 
     def coverage(self):
         return float((self.belief == FREE).sum()) / self.w.mappable
 
     def step(self, a):
+        reward = self._move(a)
+        done = self.coverage() > 0.95
+        trunc = self.steps >= self.max_steps
+        return self._obs(), reward, done, trunc, {'coverage': self.coverage(), 'collisions': self.collisions}
+
+    def _move(self, a):
+        """One 1 s motion primitive + sensing. Returns its reward; logs coverage once per second."""
         v, wz = ACTIONS[a] * self.np_random.uniform(0.9, 1.1, 2)   # 10% actuation noise
         collided = False
         n = 10
@@ -110,9 +120,61 @@ class ExploreEnv(gym.Env):
         reward = self._sense() - 0.02 - 0.5 * collided
         self.collisions += collided
         self.steps += 1
-        done = self.coverage() > 0.95
+        self.cov_log.append(self.coverage())
+        self.traj.append(self.pose[:2].copy())
+        return reward
+
+
+class MacroExploreEnv(ExploreEnv):
+    """Hierarchical version: an action picks one of the K nearest frontier candidates; a BFS path follower
+    drives there with the 1 s primitives. One step lasts until the goal is reached or seen (no longer a
+    frontier), 60 s pass, or 3 bumps. Reward = sum of the 1 s rewards. Slot 0 = greedy nearest frontier."""
+
+    def __init__(self, max_macro_s=60, **kw):
+        super().__init__(**kw)
+        self.max_macro_s = max_macro_s
+        self.observation_space = spaces.Dict({
+            'map': spaces.Box(0, 255, (N_CHANNELS, CROP, CROP), np.uint8),
+            'cands': spaces.Box(-np.inf, np.inf, (K, N_FEAT), np.float32)})
+        self.action_space = spaces.Discrete(K)
+
+    def _macro_obs(self):
+        for _ in range(2):
+            self.dist = plan(self.belief, self.bumps, self._cell(self.pose))
+            self.goals, feats = candidates(self.belief, self.dist, self.pose, self.w.origin)
+            if len(self.goals) or not self.bumps.any():
+                break
+            self.bumps[:] = False                         # nothing left: forget bumps/blacklist once and retry
+        return {'map': self._obs(), 'cands': feats}
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed, options=options)
+        self.bumps = np.zeros(self.w.occ.shape, bool)
+        return self._macro_obs(), {}
+
+    def step(self, a):
+        reward = 0.0
+        if len(self.goals):
+            goal = self.goals[min(int(a), len(self.goals) - 1)]
+            path = path_to(self.dist, goal)
+            coll0, known0 = self.collisions, self.known
+            for _ in range(self.max_macro_s):
+                before = self.collisions
+                reward += self._move(steer(self.pose, path, self.w.origin))
+                if self.collisions > before:              # bumper: remember the cell ahead as an obstacle
+                    x, y, th = self.pose
+                    r, c = self._cell((x + 0.25 * np.cos(th), y + 0.25 * np.sin(th), th))
+                    self.bumps[np.clip(r, 0, self.bumps.shape[0] - 1), np.clip(c, 0, self.bumps.shape[1] - 1)] = True
+                r, c = self._cell(self.pose)
+                if (self.steps >= self.max_steps or self.coverage() > 0.95 or self.collisions - coll0 >= 3
+                        or abs(r - goal[0]) + abs(c - goal[1]) <= REACHED or not is_frontier(self.belief, goal)):
+                    break
+            if self.known == known0 and is_frontier(self.belief, goal):
+                self.bumps[tuple(goal)] = True            # no progress toward it: blacklist (as lidar_explorer)
+        obs = self._macro_obs()
+        done = self.coverage() > 0.95 or not len(self.goals)  # no reachable frontier left = finished
         trunc = self.steps >= self.max_steps
-        return self._obs(), reward, done, trunc, {'coverage': self.coverage(), 'collisions': self.collisions}
+        return obs, reward, done, trunc, {'coverage': self.coverage(), 'collisions': self.collisions}
 
 
 if __name__ == '__main__':   # self-check: spawn, sensing, collision blocking, obs shape
